@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Math Runner (+ - × ÷)</title>
+  <style>
+    html, body { height: 100%; margin: 0; background:#0b1020; color:#e7ecff; font-family: system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans JP", sans-serif; }
+    .wrap { display:flex; align-items:center; justify-content:center; height:100%; }
+    canvas { background:#0f1633; border:1px solid rgba(255,255,255,.12); border-radius:14px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    .hint { position: fixed; left: 12px; bottom: 10px; font-size: 12px; opacity:.75; line-height:1.6; }
+    .hint kbd { background:rgba(255,255,255,.12); padding:2px 6px; border-radius:6px; border:1px solid rgba(255,255,255,.15); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="c" width="900" height="520"></canvas>
+  </div>
+  <div class="hint">
+    操作: <kbd>←</kbd><kbd>→</kbd> でレーン移動 / <kbd>R</kbd> リスタート<br>
+    ルール: カウントダウンが0になる前に左右を選ぶ。数を0以下にしないでスコアを伸ばそう！
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  // --- Helpers
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const rand = (a, b) => Math.random() * (b - a) + a;
+  const choice = (arr) => arr[(Math.random() * arr.length) | 0];
+
+  // --- Game constants
+  const W = canvas.width, H = canvas.height;
+  const lanes = [W * 0.30, W * 0.70];
+  const groundY = H * 0.78;
+  const gateX = W * 0.78;
+
+  const COLORS = {
+    bg1: "#0f1633",
+    line: "rgba(255,255,255,.12)",
+    text: "#e7ecff",
+    good: "#76ffb2",
+    bad: "#ff6b8b",
+    accent: "#7aa7ff",
+    opBox: "rgba(255,255,255,.08)"
+  };
+
+  // --- Game state
+  let state = "title"; // title, difficulty, play, gameover, win
+  let t = 0;
+  let score = 0;
+  let difficulty = "normal"; // easy, normal, hard
+  let attempts = 0; // 判定回数
+  let deadline = 0; // デッドライン（初期値0、毎回-50を減らす）
+
+  let player = {
+    lane: 0,
+    x: W * 0.22,
+    y: groundY,
+    r: 18,
+    value: 10
+  };
+
+  // ゲート表示時間（秒）
+  const TIMERS = {
+    easy: 1.9,
+    normal: 1.0,
+    hard: 0.5
+  };
+
+  // gate: { centerX, timeCreated, duration, left, right }
+  let currentGate = null;
+  let nextGateTimer = 0;
+  let speed = 220; // px/sec
+
+  // Options: operators and ranges
+  // 割り算と引き算の確率を上げ、掛け算と足し算の確率を下げる
+  const OPS = ["+", "-", "-", "-", "×", "÷", "÷", "÷"];
+  const EASY_OPS = ["+", "×"]; // 最初の10回用（片側）
+  const HARD_OPS = ["-", "÷"]; // 最初の10回で片側に必ず入るグループ
+
+  function makeOp(mode) {
+    let opsToUse;
+    if (mode === "early") opsToUse = EASY_OPS;
+    else if (mode === "hard") opsToUse = HARD_OPS;
+    else opsToUse = OPS;
+
+    const op = choice(opsToUse);
+
+    // 数は見やすく＆割り算は割り切れるように調整
+    if (op === "+") return { op, n: (rand(2, 15) | 0) };
+    if (op === "-") return { op, n: (rand(2, 15) | 0) };
+    if (op === "×") return { op, n: (rand(1, 3)  | 0) };
+    // ÷: 割り切れる候補を作る
+    const d = (rand(2, 9) | 0);
+    return { op, n: d };
+  }
+
+  function makeGate() {
+    // 最初の10回は片側が EASY_OPS、もう片側が HARD_OPS になるようにする
+    const early = attempts < 10;
+
+    let L, R;
+    if (early) {
+      if (Math.random() < 0.5) {
+        L = makeOp("early");
+        R = makeOp("hard");
+      } else {
+        L = makeOp("hard");
+        R = makeOp("early");
+      }
+      let guard = 0;
+      while (R.op === L.op && guard++ < 10) {
+        R = (R.op === "-" || R.op === "÷") ? makeOp("hard") : makeOp("early");
+      }
+    } else {
+      // 通常はランダムに選ぶ
+      L = makeOp();
+      R = makeOp();
+      let guard = 0;
+      while (R.op === L.op && guard++ < 10) R = makeOp();
+    }
+
+    currentGate = {
+      centerX: W * 0.5,
+      timeCreated: t,
+      duration: TIMERS[difficulty],
+      left: L,
+      right: R
+    };
+  }
+
+  function applyOp(value, opObj) {
+    const { op, n } = opObj;
+    if (op === "+") return value + n;
+    if (op === "-") return value - n;
+    if (op === "×") return value * n;
+
+    // ÷: できるだけ整数に寄せる。割り切れないときは小数1桁に。
+    if (op === "÷") {
+      const out = value / n;
+      // ほぼ整数なら整数化
+      const near = Math.round(out);
+      if (Math.abs(out - near) < 1e-9) return near;
+      return Math.round(out * 10) / 10;
+    }
+    return value;
+  }
+
+  function restart() {
+    state = "title";
+    t = 0;
+    score = 0;
+    speed = 220;
+    player.lane = 0;
+    player.value = 10;
+    currentGate = null;
+    nextGateTimer = 0.2;
+    attempts = 0;
+    deadline = 0;
+  }
+
+  // --- Input
+  const keys = new Set();
+  window.addEventListener("keydown", (e) => {
+    keys.add(e.key);
+    if (["ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+
+    if (e.key === "r" || e.key === "R") restart();
+
+    if (state === "title" && (e.key === " " || e.key === "Enter")) {
+      state = "difficulty";
+    }
+
+    if (state === "difficulty") {
+      if (e.key === "1") { difficulty = "easy"; state = "play"; makeGate(); }
+      if (e.key === "2") { difficulty = "normal"; state = "play"; makeGate(); }
+      if (e.key === "3") { difficulty = "hard"; state = "play"; makeGate(); }
+    }
+
+    if (state === "gameover" && (e.key === " " || e.key === "Enter")) {
+      restart();
+    }
+
+    if (state === "win" && (e.key === " " || e.key === "Enter")) {
+      restart();
+    }
+  });
+  window.addEventListener("keyup", (e) => keys.delete(e.key));
+
+  function update(dt) {
+    t += dt;
+
+    // lane move (single press feel)
+    if (state === "play") {
+      if (keys.has("ArrowLeft")) { player.lane = 0; }
+      if (keys.has("ArrowRight")) { player.lane = 1; }
+    }
+
+    // spawn gate
+    if (state === "play") {
+      nextGateTimer -= dt;
+      if (!currentGate && nextGateTimer <= 0) {
+        makeGate();
+      }
+      
+      if (currentGate) {
+        const elapsed = t - currentGate.timeCreated;
+        const remaining = currentGate.duration - elapsed;
+
+        // カウントダウン終了時に判定
+        if (remaining <= 0 && !currentGate.judged) {
+          currentGate.judged = true;
+
+          const chosen = player.lane === 0 ? currentGate.left : currentGate.right;
+          const before = player.value;
+          const after = applyOp(before, chosen);
+          player.value = after;
+
+          // スコア加算
+          score += 10;
+          // 徐々に速く
+          speed = Math.min(420, speed + 6);
+          
+          // 判定回数をインクリメントし、デッドラインを上げる
+          attempts++;
+          if (attempts <= 10) {
+            deadline += 3;
+          } else {
+            deadline += 30;
+          }
+
+          // 200回達成でクリア
+          if (attempts >= 200) {
+            state = "win";
+          } else if (player.value <= deadline) {
+            // デッドライン以下でゲームオーバー
+            state = "gameover";
+          } else {
+            // 次のゲート生成
+            currentGate = null;
+            nextGateTimer = 0.3;
+          }
+        }
+      }
+    }
+  }
+
+  function drawRoundedRect(x, y, w, h, r) {
+    r = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+  }
+
+  function draw() {
+    // background
+    ctx.clearRect(0,0,W,H);
+    // subtle grid
+    ctx.fillStyle = COLORS.bg1;
+    ctx.fillRect(0,0,W,H);
+
+    ctx.strokeStyle = "rgba(255,255,255,.06)";
+    ctx.lineWidth = 1;
+    for (let x=0; x<=W; x+=50) {
+      ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke();
+    }
+    for (let y=0; y<=H; y+=50) {
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke();
+    }
+
+    // lanes
+    ctx.strokeStyle = COLORS.line;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(W*0.5, H*0.1);
+    ctx.lineTo(W*0.5, H*0.95);
+    ctx.stroke();
+
+    // ground
+    ctx.strokeStyle = "rgba(255,255,255,.18)";
+    ctx.beginPath();
+    ctx.moveTo(0, groundY + 22);
+    ctx.lineTo(W, groundY + 22);
+    ctx.stroke();
+
+    // judge line
+    ctx.strokeStyle = "rgba(122,167,255,.35)";
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath();
+    ctx.moveTo(gateX, H*0.12);
+    ctx.lineTo(gateX, H*0.92);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // UI text
+    ctx.fillStyle = COLORS.text;
+    ctx.font = "600 18px system-ui, sans-serif";
+    ctx.fillText("Value:", 20, 34);
+
+    ctx.font = "800 24px system-ui, sans-serif";
+    ctx.fillStyle = COLORS.accent;
+    ctx.fillText(String(player.value), 90, 36);
+
+    ctx.fillStyle = COLORS.text;
+    ctx.font = "600 18px system-ui, sans-serif";
+    ctx.fillText("Score: " + score, 20, 62);
+    ctx.fillText("\u56de数: " + attempts + "/200", 20, 80);
+    ctx.fillText("Deadline: " + deadline, 20, 98);
+
+    // player
+    const px = lanes[player.lane];
+    const py = player.y;
+
+    // shadow
+    ctx.fillStyle = "rgba(0,0,0,.25)";
+    ctx.beginPath();
+    ctx.ellipse(px, py+28, 20, 8, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = "rgba(255,255,255,.18)";
+    ctx.beginPath();
+    ctx.arc(px, py, player.r+6, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = "#dbe7ff";
+    ctx.beginPath();
+    ctx.arc(px, py, player.r, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = "#0b1020";
+    ctx.font = "800 16px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("YOU", px, py);
+
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+
+    // gate
+    if (currentGate && state === "play") {
+      const centerX = currentGate.centerX;
+      const centerY = H * 0.35;
+      const w = 220;
+      const h = 220;
+
+      // elapsed time
+      const elapsed = t - currentGate.timeCreated;
+      const remaining = clamp(currentGate.duration - elapsed, 0, currentGate.duration);
+
+      // gate boxes
+      const gx = centerX - w * 0.5;
+      const gy = centerY - h * 0.5;
+
+      // left box
+      ctx.fillStyle = COLORS.opBox;
+      drawRoundedRect(gx, gy, w/2-10, h, 16);
+      ctx.fill();
+      // right box
+      drawRoundedRect(gx+w/2+10, gy, w/2-10, h, 16);
+      ctx.fill();
+
+      // outlines
+      ctx.strokeStyle = "rgba(255,255,255,.16)";
+      ctx.lineWidth = 2;
+      drawRoundedRect(gx, gy, w/2-10, h, 16); ctx.stroke();
+      drawRoundedRect(gx+w/2+10, gy, w/2-10, h, 16); ctx.stroke();
+
+      // labels
+      const L = currentGate.left, R = currentGate.right;
+
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#e7ecff";
+      ctx.font = "800 30px system-ui, sans-serif";
+      ctx.fillText(`${L.op} ${L.n}`, gx + (w*0.25)-5, gy + h*0.52);
+      ctx.fillText(`${R.op} ${R.n}`, gx + (w*0.75)+5, gy + h*0.52);
+
+      ctx.font = "600 12px system-ui, sans-serif";
+      ctx.fillStyle = "rgba(231,236,255,.75)";
+      ctx.fillText("LEFT", gx + (w*0.25)-5, gy + h*0.80);
+      ctx.fillText("RIGHT", gx + (w*0.75)+5, gy + h*0.80);
+
+      // countdown timer
+      ctx.textAlign = "center";
+      ctx.fillStyle = remaining > 0.5 ? "#76ffb2" : "#ff6b8b";
+      ctx.font = "800 48px system-ui, sans-serif";
+      ctx.fillText(remaining.toFixed(2), centerX, centerY - h*0.3);
+
+      ctx.textAlign = "left";
+    }
+
+    // Title / GameOver overlays
+    if (state === "title") {
+      ctx.fillStyle = "rgba(0,0,0,.35)";
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = "#e7ecff";
+      ctx.textAlign = "center";
+      ctx.font = "900 44px system-ui, sans-serif";
+      ctx.fillText("MATH RUNNER", W/2, H*0.42);
+
+      ctx.font = "600 18px system-ui, sans-serif";
+      ctx.fillStyle = "rgba(231,236,255,.85)";
+      ctx.fillText("左右で + / - / × / ÷ を選ぶだけ！", W/2, H*0.50);
+
+      ctx.font = "700 16px system-ui, sans-serif";
+      ctx.fillStyle = "rgba(122,167,255,.95)";
+      ctx.fillText("Space / Enter で難易度選択へ", W/2, H*0.58);
+      ctx.textAlign = "left";
+    }
+
+    if (state === "difficulty") {
+      ctx.fillStyle = "rgba(0,0,0,.45)";
+      ctx.fillRect(0,0,W,H);
+
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#7aa7ff";
+      ctx.font = "900 44px system-ui, sans-serif";
+      ctx.fillText("難易度を選択", W/2, H*0.35);
+
+      ctx.font = "700 28px system-ui, sans-serif";
+      ctx.fillStyle = "#76ffb2";
+      ctx.fillText("1. やさしい（1.9秒）", W/2, H*0.48);
+      
+      ctx.fillStyle = "#e7ecff";
+      ctx.fillText("2. 普通（1.0秒）", W/2, H*0.56);
+      
+      ctx.fillStyle = "#ff6b8b";
+      ctx.fillText("3. 難しい（0.5秒）", W/2, H*0.64);
+
+      ctx.textAlign = "left";
+    }
+
+    if (state === "gameover") {
+      ctx.fillStyle = "rgba(0,0,0,.45)";
+      ctx.fillRect(0,0,W,H);
+
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ff6b8b";
+      ctx.font = "900 44px system-ui, sans-serif";
+      ctx.fillText("GAME OVER", W/2, H*0.42);
+
+      ctx.fillStyle = "#e7ecff";
+      ctx.font = "700 18px system-ui, sans-serif";
+      ctx.fillText(`Final Value: ${player.value}`, W/2, H*0.50);
+      ctx.fillText(`Attempts: ${attempts}/200`, W/2, H*0.55);
+
+      ctx.fillStyle = "rgba(122,167,255,.95)";
+      ctx.font = "700 16px system-ui, sans-serif";
+      ctx.fillText("Space / Enter で再開（RでもOK）", W/2, H*0.62);
+      ctx.textAlign = "left";
+    }
+
+    if (state === "win") {
+      ctx.fillStyle = "rgba(0,0,0,.45)";
+      ctx.fillRect(0,0,W,H);
+
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#76ffb2";
+      ctx.font = "900 44px system-ui, sans-serif";
+      ctx.fillText("CLEAR!", W/2, H*0.42);
+
+      ctx.fillStyle = "#e7ecff";
+      ctx.font = "700 18px system-ui, sans-serif";
+      ctx.fillText(`Final Value: ${player.value}`, W/2, H*0.50);
+      ctx.fillText(`Score: ${score}`, W/2, H*0.55);
+
+      ctx.fillStyle = "rgba(122,167,255,.95)";
+      ctx.font = "700 16px system-ui, sans-serif";
+      ctx.fillText("Space / Enter で再開（RでもOK）", W/2, H*0.62);
+      ctx.textAlign = "left";
+    }
+  }
+
+  // --- Main loop
+  let last = performance.now();
+  function loop(now) {
+    const dt = clamp((now - last) / 1000, 0, 0.033);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  restart();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
